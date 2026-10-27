@@ -1,0 +1,110 @@
+name: V8 Cached Phi Debug Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout investigation repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          set -eux
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          df -h
+
+      - name: Install depot_tools
+        run: |
+          set -eux
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch pinned V8 source
+        env:
+          TARGET_COMMIT: aa7ac40507210f25ded5f29ccf182f8dcc1a0fd6
+        run: |
+          set -eux
+          export PATH="$HOME/depot_tools:$PATH"
+          fetch --no-history v8
+          cd v8
+          git fetch --no-tags origin "$TARGET_COMMIT"
+          git checkout --detach "$TARGET_COMMIT"
+          gclient sync -D
+          git rev-parse HEAD | tee ../v8-commit.txt
+
+      - name: Apply diagnostic assertion
+        working-directory: v8
+        run: |
+          set -eux
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/maglev/turbolev-escape-analysis.cc")
+          s = p.read_text()
+
+          lines = s.splitlines()
+          start = next(
+              (i for i, line in enumerate(lines)
+               if line.strip() == "for (auto [phi, other_key] : old_phis_) {"),
+              None,
+          )
+
+          if start is None:
+              raise SystemExit("PATCH_ABORTED: old_phis_ loop not found")
+
+          if lines[start + 1].strip() != "if (other_key != key) continue;":
+              raise SystemExit("PATCH_ABORTED: unexpected loop structure")
+
+          expected = "DCHECK_EQ(phi->input_count(), predecessors.size());"
+          if lines[start + 2].strip() != expected:
+              raise SystemExit("PATCH_ABORTED: unexpected input-count check")
+
+          if any("phi->value_representation(), first_pred_repr" in line
+                 for line in lines[start:start + 5]):
+              raise SystemExit("PATCH_ABORTED: assertion already exists")
+
+          indent = lines[start + 2][:len(lines[start + 2]) -
+                                     len(lines[start + 2].lstrip())]
+          lines.insert(
+              start + 2,
+              indent + "DCHECK_EQ(phi->value_representation(), first_pred_repr);"
+          )
+
+          p.write_text("\n".join(lines) + "\n")
+          print("DIAGNOSTIC_PATCH=APPLIED")
+          PY
+
+          grep -n -A4 -B2 \
+            'phi->value_representation(), first_pred_repr' \
+            src/maglev/turbolev-escape-analysis.cc
+
+      - name: Build and run targeted Debug test
+        working-directory: v8
+        run: |
+          set -o pipefail
+          python3 tools/dev/gm.py x64.debug \
+            mjsunit/turbolev/escape-analysis-nested-loop-revisit \
+            2>&1 | tee ../debug-test.log
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phi-debug-test-evidence
+          path: |
+            v8-commit.txt
+            debug-test.log
+          if-no-files-found: warn
