@@ -18,25 +18,36 @@ jobs:
           set -eux
           uname -a
           df -h
-          git --version
 
-      - name: Fetch target V8 revision
+      - name: Fetch pinned V8 source file
+        env:
+          TARGET_COMMIT: 23d6618512136c2e5921e3962f9878ff3501b34b
         run: |
-          git clone https://chromium.googlesource.com/v8/v8.git v8
-          cd v8
-          git checkout 23d6618512136c2e5921e3962f9878ff3501b34b
+          set -eux
+          mkdir -p evidence
+          URL="https://raw.githubusercontent.com/v8/v8/${TARGET_COMMIT}/src/maglev/turbolev-escape-analysis.cc"
+          curl --fail --location --retry 3 "$URL" \
+            -o evidence/turbolev-escape-analysis.cc
+          echo "TARGET_COMMIT=${TARGET_COMMIT}" \
+            | tee evidence/target.txt
+          sha256sum evidence/turbolev-escape-analysis.cc \
+            | tee evidence/source.sha256
+          test -s evidence/turbolev-escape-analysis.cc
 
-      - name: Verify target source
+      - name: Verify source context
         run: |
-          cd v8
-          git rev-parse HEAD
+          set -eux
           grep -n -A35 -B10 'old_phis_' \
-            src/maglev/turbolev-escape-analysis.cc
+            evidence/turbolev-escape-analysis.cc
+          grep -q 'old_phis_' \
+            evidence/turbolev-escape-analysis.cc
+          echo "SOURCE_FETCH_AND_CONTEXT_CHECK=PASS" \
+            | tee evidence/result.txt
 
-      - name: Save source inspection
+      - name: Upload inspection evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: v8-source-inspection
-          path: v8/src/maglev/turbolev-escape-analysis.cc
-          if-no-files-found: ignore
+          path: evidence/
+          if-no-files-found: error
