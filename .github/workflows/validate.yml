@@ -1,0 +1,42 @@
+name: V8 Cached Phi Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout validation repository
+        uses: actions/checkout@v4
+
+      - name: Record environment
+        run: |
+          set -eux
+          uname -a
+          df -h
+          git --version
+
+      - name: Fetch target V8 revision
+        run: |
+          git clone https://chromium.googlesource.com/v8/v8.git v8
+          cd v8
+          git checkout 23d6618512136c2e5921e3962f9878ff3501b34b
+
+      - name: Verify target source
+        run: |
+          cd v8
+          git rev-parse HEAD
+          grep -n -A35 -B10 'old_phis_' \
+            src/maglev/turbolev-escape-analysis.cc
+
+      - name: Save source inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-source-inspection
+          path: v8/src/maglev/turbolev-escape-analysis.cc
+          if-no-files-found: ignore
