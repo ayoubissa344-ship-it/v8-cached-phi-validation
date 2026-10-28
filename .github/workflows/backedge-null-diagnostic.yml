@@ -1,0 +1,98 @@
+name: V8 Backedge Null Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout investigation repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          df -h
+
+      - name: Install depot_tools
+        run: |
+          set -eux
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch pinned V8 source
+        env:
+          TARGET_COMMIT: aa7ac40507210f25ded5f29ccf182f8dcc1a0fd6
+        run: |
+          set -eux
+          export PATH="$HOME/depot_tools:$PATH"
+          fetch --no-history v8
+          cd v8
+          git fetch --no-tags origin "$TARGET_COMMIT"
+          git checkout --detach "$TARGET_COMMIT"
+          gclient sync -D
+          git rev-parse HEAD | tee ../v8-commit.txt
+
+      - name: Add backedge null diagnostic
+        working-directory: v8
+        run: |
+          set -eux
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/maglev/turbolev-escape-analysis.cc")
+          s = p.read_text()
+
+          needle = """ValueNode* backedge_val = field_values().Get(key);
+
+            if (InlinedAllocation* backedge_alloc =
+                    data_.TryGetCandidateInlinedAllocation(backedge_val)) {"""
+
+          if s.count(needle) != 1:
+              raise SystemExit(
+                  "PATCH_ABORTED: expected unique backedge use not found"
+              )
+
+          replacement = """ValueNode* backedge_val = field_values().Get(key);
+
+            CHECK_NOT_NULL(backedge_val);
+
+            if (InlinedAllocation* backedge_alloc =
+                    data_.TryGetCandidateInlinedAllocation(backedge_val)) {"""
+
+          p.write_text(s.replace(needle, replacement, 1))
+          print("BACKEDGE_NULL_CHECK=APPLIED")
+          PY
+
+          grep -n -A7 -B3 \
+            'CHECK_NOT_NULL(backedge_val)' \
+            src/maglev/turbolev-escape-analysis.cc
+
+      - name: Build and run targeted Debug test
+        working-directory: v8
+        run: |
+          set -o pipefail
+          python3 tools/dev/gm.py x64.debug \
+            mjsunit/turbolev/escape-analysis-nested-loop-revisit \
+            2>&1 | tee ../backedge-diagnostic.log
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backedge-null-diagnostic
+          path: |
+            v8-commit.txt
+            backedge-diagnostic.log
+          if-no-files-found: warn
