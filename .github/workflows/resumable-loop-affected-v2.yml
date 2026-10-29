@@ -1,0 +1,140 @@
+name: V8 Resumable Loop Affected Diagnostic v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  affected-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout investigation repository
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          df -h
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch affected V8 revision
+        run: |
+          set -eux
+          export PATH="$HOME/depot_tools:$PATH"
+          fetch --no-history v8
+          cd v8
+          git fetch --no-tags origin \
+            aa7ac40507210f25ded5f29ccf182f8dcc1a0fd6
+          git checkout --detach \
+            aa7ac40507210f25ded5f29ccf182f8dcc1a0fd6
+          gclient sync -D
+          git rev-parse HEAD | tee ../v8-commit.txt
+
+      - name: Install regression test
+        working-directory: v8
+        run: |
+          set -eux
+          cat > test/mjsunit/turbolev/escape-analysis-regress-561781465.js <<'JS'
+          // Copyright 2026 the V8 project authors. All rights reserved.
+          // Use of this source code is governed by a BSD-style license that can be
+          // found in the LICENSE file.
+
+          // Flags: --allow-natives-syntax --turbolev --turbolev-escape-analysis
+
+          function* foo() {
+            for (let i = 0; i < 4; i++) {
+              const o = { y: "abc" };
+              for (let j = 0; j < 5; j++) {
+                o.y = {};
+              }
+              if (i < 1) {
+                o.y = "def";
+              }
+              for (let k = 0; k < 2; k++) {
+                for (let c = 0; c;) {
+                  yield;
+                }
+              }
+            }
+          }
+
+          %PrepareFunctionForOptimization(foo);
+          foo().next();
+          %OptimizeFunctionOnNextCall(foo);
+          foo().next();
+          JS
+
+      - name: Instrument null-predecessor condition
+        working-directory: v8
+        run: |
+          set -eux
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/maglev/turbolev-escape-analysis.cc")
+          s = p.read_text()
+
+          needle = (
+              "      for (ValueNode* pred : predecessors) {\n"
+              "        if (pred == nullptr) {\n"
+          )
+          if s.count(needle) != 1:
+              raise SystemExit("PATCH_ABORTED: expected unique null predecessor branch")
+
+          insertion = (
+              "          if (block->is_loop() && predecessors[0] != nullptr) {\n"
+              "            DCHECK(block->state()->is_resumable_loop());\n"
+              "            CHECK(false);\n"
+              "          }\n"
+          )
+          p.write_text(s.replace(needle, needle + insertion, 1))
+          print("INSTRUMENTATION_APPLIED")
+          PY
+
+      - name: Build and run diagnostic
+        working-directory: v8
+        run: |
+          set -o pipefail
+          set +e
+          python3 tools/dev/gm.py x64.debug \
+            mjsunit/turbolev/escape-analysis-regress-561781465 \
+            2>&1 | tee ../resumable-loop.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if grep -Eq \
+            'turbolev-escape-analysis\.cc:[0-9]+: Check failed: false' \
+            ../resumable-loop.log; then
+            echo "RESULT=TARGET_NULL_PREDECESSOR_CONDITION_REACHED"
+            exit 0
+          fi
+
+          if [ "$status" -eq 0 ]; then
+            echo "RESULT=TARGET_CONDITION_NOT_REACHED"
+            exit 1
+          fi
+
+          echo "RESULT=BUILD_OR_UNRELATED_RUNTIME_FAILURE"
+          exit "$status"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resumable-loop-affected-v2
+          path: |
+            v8-commit.txt
+            resumable-loop.log
+          if-no-files-found: warn
