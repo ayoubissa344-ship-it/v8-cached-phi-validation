@@ -45,7 +45,7 @@ jobs:
           gclient sync -D
           git rev-parse HEAD | tee ../v8-commit.txt
 
-      - name: Apply diagnostic assertion
+      - name: Apply PHI reuse instrumentation
         working-directory: v8
         run: |
           set -eux
@@ -55,49 +55,78 @@ jobs:
           p = Path("src/maglev/turbolev-escape-analysis.cc")
           s = p.read_text()
 
+          if "#include <stdio.h>" not in s:
+              s = "#include <stdio.h>\n" + s
+
           lines = s.splitlines()
           start = next(
               (i for i, line in enumerate(lines)
                if line.strip() == "for (auto [phi, other_key] : old_phis_) {"),
               None,
           )
-
           if start is None:
               raise SystemExit("PATCH_ABORTED: old_phis_ loop not found")
 
-          if lines[start + 1].strip() != "if (other_key != key) continue;":
-              raise SystemExit("PATCH_ABORTED: unexpected loop structure")
-
           expected = "DCHECK_EQ(phi->input_count(), predecessors.size());"
-          if lines[start + 2].strip() != expected:
-              raise SystemExit("PATCH_ABORTED: unexpected input-count check")
-
-          if any("phi->value_representation(), first_pred_repr" in line
-                 for line in lines[start:start + 5]):
-              raise SystemExit("PATCH_ABORTED: assertion already exists")
-
-          indent = lines[start + 2][:len(lines[start + 2]) -
-                                     len(lines[start + 2].lstrip())]
-          lines.insert(
-              start + 2,
-              indent + "DCHECK_EQ(phi->value_representation(), first_pred_repr);"
+          check = next(
+              (i for i in range(start + 1, min(start + 8, len(lines)))
+               if lines[i].strip() == expected),
+              None,
           )
+          if check is None:
+              raise SystemExit("PATCH_ABORTED: input-count check not found")
 
+          if any("[PHI_REUSE_DIAG]" in line for line in lines):
+              raise SystemExit("PATCH_ABORTED: instrumentation already present")
+
+          indent = lines[check][:len(lines[check]) - len(lines[check].lstrip())]
+          diagnostic = [
+              indent + 'fprintf(stderr,',
+              indent + '        "[PHI_REUSE_DIAG] phi=%p phi_repr=%d first_pred_repr=%d inputs=%d predecessors=%zu fixpoint=%d\\n",',
+              indent + '        static_cast<void*>(phi),',
+              indent + '        static_cast<int>(phi->value_representation()),',
+              indent + '        static_cast<int>(first_pred_repr),',
+              indent + '        phi->input_count(), predecessors.size(),',
+              indent + '        is_loop_fixpoint_check);',
+              indent + 'fprintf(stderr, "[PHI_REUSE_MISMATCH] mismatch=%d\\n",',
+              indent + '        phi->value_representation() != first_pred_repr);',
+          ]
+
+          lines[check:check] = diagnostic
           p.write_text("\n".join(lines) + "\n")
-          print("DIAGNOSTIC_PATCH=APPLIED")
+          print("PHI_REUSE_INSTRUMENTATION=APPLIED")
           PY
+          grep -n -A12 -B2 '\[PHI_REUSE_DIAG\]' src/maglev/turbolev-escape-analysis.cc
 
-          grep -n -A4 -B2 \
-            'phi->value_representation(), first_pred_repr' \
-            src/maglev/turbolev-escape-analysis.cc
-
-      - name: Build and run targeted Debug test
+      - name: Build and run targeted Debug tests
         working-directory: v8
         run: |
-          set -o pipefail
+          set -uo pipefail
+
+          cp ../evidence/phi-reuse-target.js \
+            test/mjsunit/turbolev/phi-reuse-target.js
+
+          echo "=== ORIGINAL REPRODUCER ==="
           python3 tools/dev/gm.py x64.debug \
             mjsunit/turbolev/escape-analysis-nested-loop-revisit \
             2>&1 | tee ../debug-test.log
+          original_status=${PIPESTATUS[0]}
+
+          echo "=== EXTENDED PHI REUSE CANDIDATE ==="
+          python3 tools/dev/gm.py x64.debug \
+            mjsunit/turbolev/phi-reuse-target \
+            2>&1 | tee -a ../debug-test.log
+          extended_status=${PIPESTATUS[0]}
+
+          echo "ORIGINAL_STATUS=$original_status" \
+            | tee -a ../debug-test.log
+          echo "EXTENDED_STATUS=$extended_status" \
+            | tee -a ../debug-test.log
+
+          if [ "$original_status" -ne 0 ] || \
+             [ "$extended_status" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Upload diagnostic evidence
         if: always()
@@ -107,4 +136,5 @@ jobs:
           path: |
             v8-commit.txt
             debug-test.log
+            evidence/phi-reuse-target.js
           if-no-files-found: warn
